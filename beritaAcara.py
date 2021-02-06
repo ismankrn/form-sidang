@@ -1,4 +1,4 @@
-from flask import Flask, redirect, url_for, render_template, request, send_from_directory, make_response, session
+from flask import Flask, redirect, url_for, render_template, request, send_from_directory, make_response, session, send_file
 import os
 import pandas as pd
 import numpy as np
@@ -10,6 +10,10 @@ import pytz
 import joblib
 import secrets
 import string
+import boto3
+import botocore
+import io
+import xlsxwriter
 
 
 app = Flask(__name__)
@@ -22,9 +26,14 @@ path_jadwal_sidang = "/".join([path_data,"jadwal_sidang"])
 path_output = "/".join([path_data,"output"])
 data_admin = "/".join([path_data,"login_admin.p"])
 data_recap = "/".join([path_data,"recap.p"])
+data_recap_reprint = "/".join([path_data,"recap_reprint.p"])
 data_lecturer = "/".join([path_data,"lec_code.p"])
 data_schedule = "/".join([path_data,"schedule.p"])
 data_rekap_xlsx = "/".join([path_data,"Rekap-Sidang-TA.xlsx"])
+
+aws_id = 'AKIA2RUFJEJBCZ3JNDNM'
+aws_secret = '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'
+bucket_name = 'form-sidang-fif'
 
 # today = date.today()
 # dead_rev = today + dtm.timedelta(days=15)
@@ -49,11 +58,8 @@ def home():
             if(nim==""):
                 # return redirect(url_for("home"))
                 return render_template("home.html",message="tidak ada")
+            nim = int(nim)
             passwd_user = request.form["password"]
-            try:
-                nim = int(nim)
-            except:
-                return render_template("home.html",message="tidak ada")
             dataMhs = cariMhs(nim,passwd_user)
             if (dataMhs=="tidak ada"):
                 return render_template("home.html",message=dataMhs)
@@ -71,6 +77,7 @@ def home():
                 session["dataMhs5"] = dataMhs[5]
                 session["dataMhs6"] = dataMhs[6]
                 session["dataMhs7"] = dataMhs[7]
+
                 return redirect(url_for("index"))
                 # return render_template("index.html", NIM=dataMhs[0], MHS=dataMhs[1],
                 #                         JTA=dataMhs[2], pbb1=dataMhs[3], pbb2=dataMhs[4],
@@ -150,12 +157,18 @@ def unduh():
             akhir=[int(s) for s in akhir.split() if s.isdigit()]
 
             # load recap
-            recap = joblib.load(data_recap)
+            # recap = joblib.load(data_recap)
+            object_key = 'heroku/recap.xlsx'
+            s3 = boto3.client('s3', aws_access_key_id=aws_id, aws_secret_access_key=aws_secret)
+            obj = s3.get_object(Bucket=bucket_name, Key=object_key)
+            data = obj['Body'].read()
+            recap = pd.read_excel(io.BytesIO(data))
+
             begin = dtm.date(awal[0], awal[1], awal[2]) # input dari date picker kiri (from)
             end = dtm.date(akhir[0], akhir[1], akhir[2]) # input dari date picker kanan (until)
             # saya belum tahu output dari date picker seperti apa, asumsi saya masih bisa diubah ke format datetime
             # filter
-            pick_recap = recap[(recap.Tanggal >= begin) & (recap.Tanggal <= end)]
+            pick_recap = recap[(recap.Tanggal_Ref >= begin) & (recap.Tanggal_Ref <= end)]
             pick_recap = pick_recap.iloc[:,1:]
             # bikin folder baru "output" di dir "data"
             filename = "Hasil-Sidang-{}-{}.xlsx".format(begin,end)
@@ -175,7 +188,15 @@ def unggah():
         if request.method=="POST":
             file = request.files["file"]
             # load schedule (.p)
-            schedule = joblib.load(data_schedule)
+            # schedule = joblib.load(data_schedule)
+
+            bucket_name = 'form-sidang-fif'
+            object_key = 'heroku/schedule.xlsx'
+            s3 = boto3.client('s3', aws_access_key_id=aws_id, aws_secret_access_key=aws_secret)
+            obj = s3.get_object(Bucket=bucket_name, Key=object_key)
+            data = obj['Body'].read()
+            schedule = pd.read_excel(io.BytesIO(data))
+
             # grab upload excel name
             excel_name = file.filename
             destination = "/".join([path_jadwal_sidang,file.filename])
@@ -189,7 +210,7 @@ def unggah():
             # return str(len(col_name))
             col_name_ref =['No.', 'Nama', 'NIM', 'E-mail', 'KK', 'Pembimbing 1',
                         'Pembimbing 2', 'Penguji 1', 'Penguji 2','Judul',
-                        'Waktu', 'Pukul', 'Keterangan', 'Lokasi']
+                        'Tanggal', 'Pukul', 'Skema sidang', 'Lokasi']
             # verify uploaded file is suitable
             if col_name != col_name_ref:
             # tampilkan tulisan "Format file yang diunggah tidak sesuai dengan template"
@@ -209,18 +230,155 @@ def unggah():
                 # concat
                 new_schedule = pd.concat([diff_schedule, inp_schedule], axis=0)
                 new_schedule.reset_index(drop=True, inplace=True)
-                # save to excel
-                excel_pwd_name = file.filename.replace(".xlsx","_pwd.xlsx")
-                path_excel_pwd = "/".join(["data/jadwal_sidang/",excel_pwd_name])
-                add_schedule.to_excel(path_excel_pwd, index=None)
+
                 # save as pickle
-                joblib.dump(new_schedule, data_schedule)
-                # path_jadwal = os.path.join(APP_ROOT, 'data/jadwal_sidang')
-                return render_template("unggah.html",download="true", filenames=excel_pwd_name, tipe="1")
-                # return send_from_directory(path_jadwal,filename=excel_pwd_name, as_attachment=True)
-                # return render_template("unggah.html",download="true", filenames=excel_pwd_name)
-                # return path_excel_pwd
+                # joblib.dump(new_schedule, data_schedule)
+                # save to s3
+                with io.BytesIO() as output:
+                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                        new_schedule.to_excel(writer, index=None)
+                    data = output.getvalue()
+                bucket_name = 'form-sidang-fif'
+                object_name = 'heroku/schedule.xlsx'
+
+                s3 = boto3.resource('s3', aws_access_key_id=aws_id, aws_secret_access_key=aws_secret)
+                s3.Bucket(bucket_name).put_object(Key=object_name, Body=data)
+
+
+                # save to excel
+                # excel_pwd_name = file.filename.replace(".xlsx","_pwd.xlsx")
+                # path_excel_pwd = "/".join(["data/jadwal_sidang/",excel_pwd_name])
+                # add_schedule.to_excel(path_excel_pwd, index=None)
+                # return render_template("unggah.html",download="true", filenames=excel_pwd_name, tipe="1")
+
+                # save to s3
+                excel_pwd_name = file.filename.replace(".xlsx","_pwd.xlsx")
+                with io.BytesIO() as output:
+                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                        add_schedule.to_excel(writer, index=None)
+                    data = output.getvalue()
+                bucket_name = 'form-sidang-fif'
+                object_name = "/".join(["heroku/jadwal_sidang",excel_pwd_name])
+                print(object_name)
+
+                s3 = boto3.resource('s3', aws_access_key_id=aws_id, aws_secret_access_key=aws_secret)
+                s3.Bucket(bucket_name).put_object(Key=object_name, Body=data)
+
+                # download from s3
+                bucket = "form-sidang-fif"
+                s3 = boto3.resource('s3', aws_access_key_id=aws_id, aws_secret_access_key=aws_secret)
+                filename = excel_pwd_name
+                output = f"./{filename}"
+                s3.Bucket(bucket).download_file(object_name, output)
+                return send_file(output, as_attachment=True)
+
         return render_template("unggah.html")
+    else:
+        return redirect(url_for("login"))
+
+@app.route("/admin/rekap",methods=["GET", "POST"])
+def rekap():
+    if "admin" in session:
+        admin = session["admin"]
+        if request.method=="POST":
+            nim=request.form['NIM']
+            if(nim==""):
+                # return redirect(url_for("home"))
+                return render_template("rekap.html",message="tidak ada")
+            # nim = int(nim)
+            try:
+                # recap_rep = joblib.load(data_recap_reprint)
+                object_key = 'heroku/recap_reprint.xlsx'
+                s3 = boto3.client('s3', aws_access_key_id=aws_id, aws_secret_access_key=aws_secret)
+                obj = s3.get_object(Bucket=bucket_name, Key=object_key)
+                data = obj['Body'].read()
+                recap_rep = pd.read_excel(io.BytesIO(data))
+            except:
+                recap_rep = "tidak ada file recap_reprint"
+
+            # Cek data mahasiswa dari recap_reprint
+            nim_list = recap_rep.NIM.values.tolist()
+            if nim in nim_list:
+                sel_data = recap_rep[recap_rep.NIM == nim]
+                NIM = nim
+                MHS = sel_data["Nama"].values[0]
+                JTA = sel_data["Judul"].values[0]
+                pbb1 = sel_data["Pembimbing 1"].values[0]
+                pbb2 = sel_data["Pembimbing 2"].values[0]
+                pgj1 = sel_data["Penguji 1"].values[0]
+                pgj2 = sel_data["Penguji 2"].values[0]
+
+                DPb11 = sel_data["PBB1_CLO1"].values[0]
+                DPb12 = sel_data["PBB1_CLO2"].values[0]
+                DPb13 = sel_data["PBB1_CLO3"].values[0]
+                DPb21 = sel_data["PBB2_CLO1"].values[0]
+                DPb22 = sel_data["PBB2_CLO2"].values[0]
+                DPb23 = sel_data["PBB2_CLO3"].values[0]
+
+                DPg11 = sel_data["PBB1_CLO1"].values[0]
+                DPg12 = sel_data["PBB1_CLO2"].values[0]
+                DPg13 = sel_data["PBB1_CLO3"].values[0]
+                DPg21 = sel_data["PBB2_CLO1"].values[0]
+                DPg22 = sel_data["PBB2_CLO2"].values[0]
+                DPg23 = sel_data["PBB2_CLO3"].values[0]
+
+                KL = sel_data["Status"].values[0]
+                date =sel_data["Tanggal"].values[0]
+                time = sel_data["Waktu"].values[0]
+                ruangan = sel_data["Ruangan"].values[0]
+
+                LPb = hitungPembimbing(DPb11,DPb12,DPb13,DPb21,DPb22,DPb23)
+                LPg = hitungPenguji(DPg11,DPg12,DPg13,DPg21,DPg22,DPg23)
+                LNP = hitungNilaiTotal(LPb,LPg)
+                LNA = hitungNilaiAkhir(LNP)
+                INA =round( (0.35*LNA[0]) + (0.3*LNA[1]) + (0.35*LNA[2]),2)
+                LIA = indexing(INA)
+                cetak = "1"
+                editable = "0"
+                html = render_template("form_rekap.html",
+                                    DPb11=DPb11, DPb12=DPb12, DPb13=DPb13,
+                                    DPb21=DPb21, DPb22=DPb22, DPb23=DPb23,
+                                    LPb1=LPb[0] , LPb2=LPb[1] , LPb3=LPb[2] ,
+                                    DPg11=DPg11, DPg12=DPg12, DPg13=DPg13,
+                                    DPg21=DPg21, DPg22=DPg22, DPg23=DPg23,
+                                    LPg1=LPg[0] , LPg2=LPg[1] , LPg3=LPg[2] ,
+                                    LNP1=LNP[0] , LNP2=LNP[1] , LNP3=LNP[2] ,
+                                    LNA1=LNA[0] , LNA2=LNA[1] , LNA3=LNA[2] ,
+                                    LIA=LIA, INA=INA, KL=KL,
+                                    NIM=NIM, MHS=MHS, JTA=JTA,
+                                    pbb1=pbb1, pbb2=pbb2,
+                                    pgj1=pgj1, pgj2=pgj2,
+                                    cetak=cetak, message="success" ,date=date,
+                                    current_time=time, ruangan=ruangan)
+                # print pdf
+                filename_pdf = "Form-Sidang-"+str(NIM)+"-"+MHS+".pdf"
+                headers_filename = "attachment; filename="+filename_pdf
+                css = ["static/css/bootstrap.min.css","static/style.css"]
+                ## uncomment config yang dipilih
+                    # config for heroku :
+                # config = pdfkit.configuration(wkhtmltopdf='/usr/local/bin/wkhtmltopdf')
+                    # config for local ver 1 :
+                # config = pdfkit.configuration(wkhtmltopdf='./bin/wkhtmltopdf')
+                    # config for local ver 2 :
+                # path_wkhtmltopdf = "/usr/local/bin/wkhtmltopdf"
+                path_wkhtmltopdf = "./bin/wkhtmltopdf"
+                config = pdfkit.configuration(wkhtmltopdf=path_wkhtmltopdf)
+
+                pdf = pdfkit.from_string(html, False,configuration=config, css=css)
+                # config for local pc
+                # pdf = pdfkit.from_string(html, False, css=css)
+                response = make_response(pdf)
+                response.headers["Content-Type"] = "application/pdf"
+                response.headers["Content-Disposition"] = headers_filename
+                response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+                response.headers["Pragma"] = "no-cache"
+                response.headers["Expires"] = "0"
+                response.headers['Cache-Control'] = 'public, max-age=0'
+                return response
+
+            else:
+                return render_template("rekap.html",message="tidak ada")
+        return render_template("rekap.html")
     else:
         return redirect(url_for("login"))
 
@@ -322,12 +480,15 @@ def index():
             DPg22 = request.form['DPg22']
             DPg23 = request.form['DPg23']
 
+
             editable = request.form['editable']
             KL = request.form['KL']
             # IA = request.form['IA']
             RVS = request.form['RVS']
+            RVS_2 = RVS.splitlines( )
             time = request.form['current_time']
             ruangan = request.form['ruangan']
+
 
             if(current_time!=time and time!=""):
                 current_time=time
@@ -337,6 +498,14 @@ def index():
                     cetak = request.form['cetak']
                 except:
                     cetak = "0"
+                try:
+                    submit = request.form['submit']
+                except:
+                    submit = "0"
+                try:
+                    belum_submit = request.form['belum_submit']
+                except:
+                    belum_submit = "1"
 
                 LPb = hitungPembimbing(DPb11,DPb12,DPb13,DPb21,DPb22,DPb23)
                 LPg = hitungPenguji(DPg11,DPg12,DPg13,DPg21,DPg22,DPg23)
@@ -357,24 +526,102 @@ def index():
                                     MHS=MHS, JTA=JTA, pbb1=pbb1,
                                     KL=KL,
                                     pbb2=pbb2, pgj1=pgj1, pgj2=pgj2, cetak=cetak,
-                                    RVS=RVS,  message="success" ,date=today,
-                                    dead_rev=dead_rev, current_time=current_time, ruangan=ruangan, editable=editable)
+                                    RVS=RVS, RVS_2=RVS_2,  message="success" ,date=today,
+                                    dead_rev=dead_rev, current_time=current_time, ruangan=ruangan, editable=editable,belum_submit=belum_submit)
                 # return cetak
-                if (cetak=="1"):
+                try:
+                    logout = request.form['logout']
+                except:
+                    logout = "0"
+                if (logout=="1"):
+                    return redirect(url_for("clearSession"))
+                if(submit=="1"):
                     # recap
-                    recap = joblib.load(data_recap)
-                    new_today = dtm.datetime.strptime(today, '%d-%b-%Y')
-                    recap = recap.append({"Tanggal": new_today, "NIM":NIM, "Nama":MHS, "Judul":JTA, "Indeks":LIA}, ignore_index=True)
-                    joblib.dump(recap, data_recap)
-                    # recap.to_excel(data_rekap_xlsx, index=None)
+                    # recap = joblib.load(data_recap)
+                    bucket_name = 'form-sidang-fif'
+                    object_key = 'heroku/recap.xlsx'
+                    s3 = boto3.client('s3', aws_access_key_id=aws_id, aws_secret_access_key=aws_secret)
+                    obj = s3.get_object(Bucket=bucket_name, Key=object_key)
+                    data = obj['Body'].read()
+                    recap = pd.read_excel(io.BytesIO(data))
 
+                    new_today = dtm.datetime.strptime(today, '%d-%b-%Y')
+                    # recap
+                    recap = recap.append({"Tanggal_Ref": new_today,"Nama": MHS, "NIM": NIM, "Judul": JTA,
+                    "CLO 1": indexing(LNA[0]), "CLO 2": indexing(LNA[1]), "CLO 3": indexing(LNA[2]), "Nilai Akhir": INA,
+                    "Indeks Akhir": LIA, "Status": KL, "Tanggal": today, "Waktu": current_time,
+                    "Pembimbing 1": pbb1, "Pembimbing 2": pbb2, "Penguji 1": pgj1, "Penguji 2": pgj2}, ignore_index=True)
+
+                    # joblib.dump(recap, data_recap)
+                    # save recap to s3
+                    with io.BytesIO() as output:
+                        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                            recap.to_excel(writer, index=None)
+                        data = output.getvalue()
+                    object_name = 'heroku/recap.xlsx'
+
+                    s3 = boto3.resource('s3', aws_access_key_id=aws_id, aws_secret_access_key=aws_secret)
+                    s3.Bucket(bucket_name).put_object(Key=object_name, Body=data)
+
+
+                    # recap reprint
+                    # recap_reprint = joblib.load(data_recap_reprint)
+
+                    object_key = 'heroku/recap_reprint.xlsx'
+                    s3 = boto3.client('s3', aws_access_key_id=aws_id, aws_secret_access_key=aws_secret)
+                    obj = s3.get_object(Bucket=bucket_name, Key=object_key)
+                    data = obj['Body'].read()
+                    recap_reprint = pd.read_excel(io.BytesIO(data))
+
+                    recap_reprint = recap_reprint.append({"Tanggal_Ref": new_today, "Nama": MHS, "NIM": NIM, "Judul": JTA,
+                    "PBB1_CLO1": DPb11, "PBB1_CLO2": DPb12, "PBB1_CLO3": DPb13,
+                    "PBB2_CLO1": DPb21, "PBB2_CLO2": DPb22, "PBB2_CLO3": DPb23,
+                    "PNG1_CLO1": DPg11, "PNG1_CLO2": DPg12, "PNG1_CLO3": DPg13,
+                    "PNG2_CLO1": DPg21, "PNG2_CLO2": DPg22, "PNG2_CLO3": DPg23,
+                    "Status": KL, "Tanggal": today, "Waktu": current_time, "Ruangan": ruangan,
+                    "Pembimbing 1": pbb1, "Pembimbing 2": pbb2,
+                    "Penguji 1": pgj1, "Penguji 2": pgj2}, ignore_index=True)
+
+
+                    # joblib.dump(recap_reprint, data_recap_reprint)
+                    # save recap to s3
+                    with io.BytesIO() as output:
+                        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                            recap.to_excel(writer, index=None)
+                        data = output.getvalue()
+                    object_name = 'heroku/recap_reprint.xlsx'
+
+                    s3 = boto3.resource('s3', aws_access_key_id=aws_id, aws_secret_access_key=aws_secret)
+                    s3.Bucket(bucket_name).put_object(Key=object_name, Body=data)
+
+                    # recap.to_excel(data_rekap_xlsx, index=None)
+                    belum_submit = "0"
+                    html = render_template("index.html",
+                                    DPb11=DPb11, DPb12=DPb12, DPb13=DPb13,
+                                    DPb21=DPb21, DPb22=DPb22, DPb23=DPb23,
+                                    LPb1=LPb[0] , LPb2=LPb[1] , LPb3=LPb[2] ,
+                                    DPg11=DPg11, DPg12=DPg12, DPg13=DPg13,
+                                    DPg21=DPg21, DPg22=DPg22, DPg23=DPg23,
+                                    LPg1=LPg[0] , LPg2=LPg[1] , LPg3=LPg[2] ,
+                                    LNP1=LNP[0] , LNP2=LNP[1] , LNP3=LNP[2] ,
+                                    LNA1=LNA[0] , LNA2=LNA[1] , LNA3=LNA[2] ,
+                                    LIA=LIA, INA=INA, NIM=NIM,
+                                    MHS=MHS, JTA=JTA, pbb1=pbb1,
+                                    KL=KL,
+                                    pbb2=pbb2, pgj1=pgj1, pgj2=pgj2, cetak=cetak,
+                                    RVS=RVS,  message="success" ,date=today,
+                                    dead_rev=dead_rev, current_time=current_time, ruangan=ruangan, editable=editable,belum_submit=belum_submit)
+                    return html
+
+                elif(cetak=="1"):
                     # print pdf
                     filename_pdf = "Form-Sidang-"+NIM+"-"+MHS+".pdf"
                     headers_filename = "attachment; filename="+filename_pdf
                     css = ["static/css/bootstrap.min.css","static/style.css"]
                     # uncomment config yang dipilih
                     # config for heroku
-                    config = pdfkit.configuration(wkhtmltopdf='./bin/wkhtmltopdf')
+                    config = pdfkit.configuration(wkhtmltopdf='/usr/local/bin/wkhtmltopdf')
+                    # config = pdfkit.configuration(wkhtmltopdf='./bin/wkhtmltopdf')
                     pdf = pdfkit.from_string(html, False,configuration=config, css=css)
                     # config for local pc
                     # pdf = pdfkit.from_string(html, False, css=css)
@@ -394,14 +641,16 @@ def index():
 
     if "dataMhs0" in session:
         editable="0"
+        lec_code = joblib.load(data_lecturer)
+        lec_name_list = lec_code.Nama.values.tolist()
         return render_template("index.html", NIM=session['dataMhs0'], MHS=session['dataMhs1'],
                                             JTA=session['dataMhs2'], pbb1=session['dataMhs3'], pbb2=session['dataMhs4'],
                                             pgj1=session['dataMhs5'], pgj2=session['dataMhs6'], ruangan=session['dataMhs7'],
-                                            cetak=cetak, message="normal",date=today,
-                                            dead_rev=dead_rev, current_time=current_time,editable=editable)
+                                            cetak=cetak, message="normal",date=today,lec_name_list=lec_name_list,
+                                            dead_rev=dead_rev, current_time=current_time,editable=editable,belum_submit="1")
     else:
         return redirect(url_for("home"))
-        return render_template("index.html",  cetak=cetak, message="normal",date=today,dead_rev=dead_rev, current_time=current_time,editable=editable)
+        # return render_template("index.html",  cetak=cetak, message="normal",date=today,dead_rev=dead_rev, current_time=current_time,editable=editable)
 
 @app.route("/clear")
 def clearSession():
@@ -425,11 +674,25 @@ def test():
 def cariMhs(nim,passwd_user):
     # [lec_code, schedule] = joblib.load(data_mahasiswa)
     lec_code = joblib.load(data_lecturer)
-    schedule = joblib.load(data_schedule)
-    recap = joblib.load(data_recap)
+
+    # schedule = joblib.load(data_schedule)
+    # load schedule from s3
+    object_key = 'heroku/schedule.xlsx'
+    s3 = boto3.client('s3', aws_access_key_id=aws_id, aws_secret_access_key=aws_secret)
+    obj = s3.get_object(Bucket=bucket_name, Key=object_key)
+    data = obj['Body'].read()
+    schedule = pd.read_excel(io.BytesIO(data))
+
+    # recap = joblib.load(data_recap)
+    # load recap from s3
+    object_key = 'heroku/recap.xlsx'
+    s3 = boto3.client('s3', aws_access_key_id=aws_id, aws_secret_access_key=aws_secret)
+    obj = s3.get_object(Bucket=bucket_name, Key=object_key)
+    data = obj['Body'].read()
+    recap = pd.read_excel(io.BytesIO(data))
+
     nim_list = schedule.NIM.values.tolist()
     recap_nim = recap.NIM.values.tolist()
-    print(nim in nim_list)
 
     # misal value NIM yang diisikan di-assign sebagai “nim”
     # condition 1
@@ -456,26 +719,27 @@ def cariMhs(nim,passwd_user):
                 # grab judul
                 judul = sel_data["Judul"].values[0]
                 # list kode dosen
-                lec_code_list = lec_code.kode.values.tolist()
+                lec_code_list = lec_code.Kode.values.tolist()
+                lec_name_list = lec_code.Nama.values.tolist()
                 # grab nama pembimbing 1
                 pbb1 = sel_data["Pembimbing 1"].values[0]
                 if pbb1 in lec_code_list:
-                    pbb1 = lec_code[lec_code.kode == pbb1].nama.values[0]
+                    pbb1 = lec_code[lec_code.Kode == pbb1].Nama.values[0]
                 # grab nama pembimbing 2
                 pbb2 = sel_data["Pembimbing 2"].values[0]
                 if pbb2 != 0:
                     if pbb2 in lec_code_list:
-                        pbb2 = lec_code[lec_code.kode == pbb2].nama.values[0]
+                        pbb2 = lec_code[lec_code.Kode == pbb2].Nama.values[0]
                 else:
                     pbb2 = ""
                 # grab nama penguji 1
                 pgj1 = sel_data["Penguji 1"].values[0]
                 if pgj1 in lec_code_list:
-                    pgj1 = lec_code[lec_code.kode == pgj1].nama.values[0]
+                    pgj1 = lec_code[lec_code.Kode == pgj1].Nama.values[0]
                 # grab nama penguji 2
                 pgj2 = sel_data["Penguji 2"].values[0]
                 if pgj2 in lec_code_list:
-                    pgj2 = lec_code[lec_code.kode == pgj2].nama.values[0]
+                    pgj2 = lec_code[lec_code.Kode == pgj2].Nama.values[0]
                 # grab lokasi sidang
                 lokasi = sel_data["Lokasi"].values[0]
                 # kirim variable ke halaman selanjutnya
@@ -566,9 +830,12 @@ def indexing(nilai_akhir):
 
 @app.route('/admin/<string:filename>')
 def download_files(filename):
-    # filename = "Rekap-Sidang-TA.xlsx"
-    return send_from_directory(path_data,
-                               filename=filename, as_attachment=True)
+    bucket = "form-sidang-fif"
+    s3 = boto3.resource('s3', aws_access_key_id=aws_id, aws_secret_access_key=aws_secret)
+    output = f"./{filename}"
+    s3.Bucket(bucket).download_file("heroku/schedule_template.xlsx", output)
+    return send_file(output, as_attachment=True)
+    # return send_from_directory(path_data, filename=filename, as_attachment=True)
 
 @app.after_request
 def add_header(r):
